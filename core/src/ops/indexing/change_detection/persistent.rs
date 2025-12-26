@@ -657,7 +657,7 @@ impl ChangeHandler for DatabaseAdapter {
 
 	async fn handle_new_directory(&self, path: &Path) -> Result<()> {
 		use crate::domain::addressing::SdPath;
-		use crate::ops::indexing::{IndexMode, IndexerJob};
+		use crate::ops::indexing::{IndexMode, IndexerJob, IndexerJobConfig};
 
 		let Some(library) = self.context.get_library(self.library_id).await else {
 			return Ok(());
@@ -678,18 +678,20 @@ impl ChangeHandler for DatabaseAdapter {
 			IndexMode::Content
 		};
 
-		let indexer_job =
-			IndexerJob::from_location(self.location_id, SdPath::local(path), index_mode);
+		let mut config = IndexerJobConfig::new(self.location_id, SdPath::local(path), index_mode);
+		config.run_in_background = true;
+
+		let indexer_job = IndexerJob::new(config);
 
 		if let Err(e) = library.jobs().dispatch(indexer_job).await {
 			tracing::warn!(
-				"Failed to spawn indexer job for directory {}: {}",
+				"Failed to spawn background indexer job for directory {}: {}",
 				path.display(),
 				e
 			);
 		} else {
 			tracing::debug!(
-				"Spawned recursive indexer job for directory: {}",
+				"Spawned background indexer job for directory: {}",
 				path.display()
 			);
 		}
@@ -797,14 +799,28 @@ impl<'a> IndexPersistence for DatabaseAdapterForJob<'a> {
 		};
 
 		let indexing_path_str = indexing_path.to_string_lossy().to_string();
-		let indexing_path_entry_id = if let Ok(Some(dir_record)) = directory_paths::Entity::find()
+		let indexing_path_entry_id = match directory_paths::Entity::find()
 			.filter(directory_paths::Column::Path.eq(&indexing_path_str))
 			.one(self.ctx.library_db())
 			.await
 		{
-			dir_record.entry_id
-		} else {
-			location_root_entry_id
+			Ok(Some(dir_record)) => dir_record.entry_id,
+			Ok(None) => {
+				// Path not found in database - this is either a new directory or a moved one.
+				// Return empty to let inode-based move detection handle it, rather than
+				// incorrectly loading entries from the entire location root.
+				self.ctx.log(format!(
+					"Indexing path not found in database: {}, treating as new (move detection via inode)",
+					indexing_path_str
+				));
+				return Ok(HashMap::new());
+			}
+			Err(e) => {
+				return Err(JobError::execution(format!(
+					"Failed to query directory_paths: {}",
+					e
+				)));
+			}
 		};
 
 		let descendant_ids = entry_closure::Entity::find()

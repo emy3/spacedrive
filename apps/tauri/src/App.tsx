@@ -27,6 +27,7 @@ import { DragDemo } from "./components/DragDemo";
 import { SpacedropWindow } from "./routes/Spacedrop";
 import { platform } from "./platform";
 import { initializeContextMenuHandler } from "./contextMenu";
+import { initializeKeybindGlobal } from "./keybinds";
 
 function App() {
 	const [client, setClient] = useState<SpacedriveClient | null>(null);
@@ -46,6 +47,9 @@ function App() {
 
 		// Initialize Tauri native context menu handler
 		initializeContextMenuHandler();
+
+		// Initialize Tauri keybind handler
+		initializeKeybindGlobal();
 
 		// Prevent default context menu globally (except in context menu windows)
 		const currentWindow = getCurrentWebviewWindow();
@@ -170,6 +174,12 @@ function App() {
 			if (unsubscribePromise) {
 				unsubscribePromise.then((unsubscribe) => unsubscribe());
 			}
+
+			// Clean up all backend TCP connections to prevent connection leaks
+			// This is especially important during development hot reloads
+			invoke("cleanup_all_connections").catch((err) => {
+				console.warn("Failed to cleanup connections:", err);
+			});
 		};
 	}, []);
 

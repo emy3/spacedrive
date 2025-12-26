@@ -18,6 +18,8 @@ import {
 	TABLE_HEADER_HEIGHT,
 } from "./useTable";
 import { useVirtualListing } from "../../hooks/useVirtualListing";
+import { DragSelect } from "./DragSelect";
+import { useEmptySpaceContextMenu } from "../../hooks/useEmptySpaceContextMenu";
 
 export const ListView = memo(function ListView() {
 	const { currentPath, sortBy, setSortBy, viewSettings, setCurrentFiles } =
@@ -35,6 +37,9 @@ export const ListView = memo(function ListView() {
 	const containerRef = useRef<HTMLDivElement>(null);
 	const headerScrollRef = useRef<HTMLDivElement>(null);
 	const bodyScrollRef = useRef<HTMLDivElement>(null);
+	const emptySpaceContextMenu = useEmptySpaceContextMenu();
+
+	// TODO: Preserve scroll position per tab using scrollPosition from context
 
 	// Check for virtual listing first
 	const { files: virtualFiles, isVirtualView } = useVirtualListing();
@@ -92,6 +97,14 @@ export const ListView = memo(function ListView() {
 				bodyScrollRef.current.scrollLeft;
 		}
 	}, []);
+
+	const handleContainerContextMenu = async (e: React.MouseEvent) => {
+		if (e.target === e.currentTarget) {
+			e.preventDefault();
+			e.stopPropagation();
+			await emptySpaceContextMenu.show(e);
+		}
+	};
 
 	// Store values in refs to avoid effect re-runs
 	const rowVirtualizerRef = useRef(rowVirtualizer);
@@ -161,8 +174,9 @@ export const ListView = memo(function ListView() {
 	const totalWidth = table.getTotalSize() + TABLE_PADDING_X * 2;
 
 	return (
-		<div ref={containerRef} className="h-full overflow-auto">
-			{/* Sticky Header */}
+		<div ref={containerRef} className="h-full overflow-auto" onContextMenu={handleContainerContextMenu}>
+			<DragSelect files={files} scrollRef={containerRef}>
+				{/* Sticky Header */}
 			<div
 				className="sticky top-0 z-10 border-b border-app-line bg-app/90 backdrop-blur-lg"
 				style={{ height: TABLE_HEADER_HEIGHT }}
@@ -291,6 +305,7 @@ export const ListView = memo(function ListView() {
 					</div>
 				</div>
 			</div>
+			</DragSelect>
 		</div>
 	);
 });

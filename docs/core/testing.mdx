@@ -60,13 +60,61 @@ Key features:
 - Automatic cleanup on drop
 - Configurable app settings
 
+## Multi-Device Testing
+
+Spacedrive provides two approaches for testing multi-device scenarios:
+
+### When to Use Subprocess Framework
+
+**Use `CargoTestRunner` subprocess framework when:**
+- Testing **real networking** with actual network discovery, NAT traversal, and connections
+- Testing **device pairing** workflows that require independent network stacks
+- Scenarios need **true process isolation** (separate memory spaces, different ports)
+- You want to test network reconnection, timeout, and failure handling
+- Testing cross-platform network behavior
+
+**Examples:** Device pairing, network discovery, connection management
+
+```rust
+// Uses real networking, separate processes
+let mut runner = CargoTestRunner::new()
+    .add_subprocess("alice", "alice_pairing_scenario")
+    .add_subprocess("bob", "bob_pairing_scenario");
+```
+
+### When to Use Custom Transport/Harness
+
+**Use custom harness with mock transport when:**
+- Testing **sync logic** without network overhead
+- Fast iteration on **data synchronization** algorithms
+- Testing **deterministic scenarios** without network timing issues
+- Verifying **database state** and **conflict resolution**
+- Need precise control over sync event ordering
+
+**Examples:** Real-time sync, backfill, content identity linking, conflict resolution
+
+```rust
+// Uses mock transport, single process, fast and deterministic
+let harness = TwoDeviceHarnessBuilder::new("sync_test")
+    .collect_events(true)
+    .build()
+    .await?;
+```
+
+### Comparison
+
+| Aspect | Subprocess Framework | Custom Harness |
+|--------|---------------------|----------------|
+| **Speed** | Slower (real networking) | Fast (in-memory) |
+| **Networking** | Real (discovery, NAT) | Mock transport |
+| **Isolation** | True process isolation | Shared process |
+| **Debugging** | Harder (multiple processes) | Easier (single process) |
+| **Determinism** | Network timing varies | Fully deterministic |
+| **Use Case** | Network features | Sync/data logic |
+
 ## Subprocess Testing Framework
 
-The subprocess framework enables testing of multi-device scenarios like pairing, file transfer, and synchronization.
-
-### Architecture
-
-The framework spawns separate `cargo test` processes for each device role:
+The subprocess framework spawns separate `cargo test` processes for each device role:
 
 ```rust
 let mut runner = CargoTestRunner::new()
@@ -128,7 +176,143 @@ Processes coordinate through:
 
 ## Common Test Patterns
 
+### Filesystem Watcher Testing
+
+When testing filesystem watcher functionality, several critical setup steps are required:
+
+#### Enable Watcher in Test Config
+
+The default `TestConfigBuilder` **disables the filesystem watcher** (for performance in sync tests). Tests that verify watcher events must explicitly enable it:
+
+```rust
+let mut config = TestConfigBuilder::new(test_root.clone())
+    .build()?;
+
+// CRITICAL: Enable watcher for change detection tests
+config.services.fs_watcher_enabled = true;
+config.save()?;
+
+let core = Core::new(config.data_dir.clone()).await?;
+```
+
+#### Use Home Directory Paths on macOS
+
+macOS temp directories (`/var/folders/...`) don't reliably deliver filesystem events. Use home directory paths instead:
+
+```rust
+// ❌ Don't use TempDir for watcher tests
+let temp_dir = TempDir::new()?;
+
+// ✅ Use home directory
+let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+let test_root = PathBuf::from(home).join(".spacedrive_test_my_test");
+
+// Clean up before
+let _ = tokio::fs::remove_dir_all(&test_root).await;
+tokio::fs::create_dir_all(&test_root).await?;
+
+// ... run test ...
+
+// Clean up after
+tokio::fs::remove_dir_all(&test_root).await?;
+```
+
+#### Ephemeral Watching Requirements
+
+Ephemeral paths must be **indexed before watching**:
+
+```rust
+// 1. Index the directory (ephemeral mode)
+let config = IndexerJobConfig::ephemeral_browse(
+    SdPath::local(dest_dir.clone()),
+    IndexScope::Current
+);
+let job = IndexerJob::new(config);
+library.jobs().dispatch(job).await?.wait().await?;
+
+// 2. Mark indexing complete (indexer job does this automatically)
+context.ephemeral_cache().mark_indexing_complete(&dest_dir);
+
+// 3. Register for watching (indexer job does this automatically)
+watcher.watch_ephemeral(dest_dir.clone()).await?;
+
+// Now filesystem events will be detected
+```
+
+<Note>
+The `IndexerJob` automatically calls `watch_ephemeral()` after successful indexing, so manual registration is only needed when bypassing the indexer.
+</Note>
+
+#### Persistent Location Watching
+
+For persistent locations, the watcher auto-loads locations at startup. New locations created during tests must be manually registered:
+
+```rust
+// After creating and indexing a location
+let location_meta = LocationMeta {
+    id: location_uuid,
+    library_id: library.id(),
+    root_path: location_path.clone(),
+    rule_toggles: RuleToggles::default(),
+};
+
+watcher.watch_location(location_meta).await?;
+```
+
+The `IndexingHarness` handles this automatically.
+
+#### Event Collection Best Practices
+
+Start collecting events **after** initialization to avoid library statistics noise:
+
+```rust
+// Complete all setup first
+let harness = IndexingHarnessBuilder::new("test").build().await?;
+let location = harness.add_and_index_location(...).await?;
+
+// Wait for setup to settle
+tokio::time::sleep(Duration::from_millis(500)).await;
+
+// Start collecting BEFORE the operation you're testing
+let mut collector = EventCollector::new(&harness.core.events);
+let handle = tokio::spawn(async move {
+    collector.collect_events(Duration::from_secs(5)).await;
+    collector
+});
+
+// Perform operation
+perform_copy_operation().await?;
+
+// Collect and verify
+let collector = handle.await.unwrap();
+let stats = collector.analyze().await;
+assert!(stats.resource_changed.get("file").copied().unwrap_or(0) >= 2);
+```
+
+The `EventCollector` automatically filters out:
+- Library statistics updates (`LibraryStatisticsUpdated`)
+- Library resource events (non-file/entry events)
+
+#### Expected Event Types
+
+Different handlers emit different event types:
+
+- **Ephemeral handler**: Individual `ResourceChanged` events per file (CREATE + MODIFY)
+- **Persistent handler**: Batched `ResourceChangedBatch` events
+
+```rust
+// Ephemeral assertion
+let file_events = stats.resource_changed.get("file").copied().unwrap_or(0);
+assert!(file_events >= 2, "Expected file ResourceChanged events");
+
+// Persistent assertion
+let batch_count = stats.resource_changed_batch.get("file").copied().unwrap_or(0);
+assert!(batch_count >= 2, "Expected file ResourceChangedBatch events");
+```
+
 ### Event Monitoring
+
+#### Waiting for Specific Events
 
 Wait for specific Core events with timeouts:
 
@@ -141,6 +325,104 @@ let event = wait_for_event(
     Duration::from_secs(30)
 ).await?;
 ```
+
+#### Collecting All Events for Analysis
+
+For tests that need to verify event emission patterns (e.g., ResourceChanged events during operations), use the shared `EventCollector` helper:
+
+```rust
+use helpers::EventCollector;
+
+// Create collector with full event capture for debugging
+let mut collector = EventCollector::with_capture(&harness.core.events);
+
+// Spawn collection task
+let collection_handle = tokio::spawn(async move {
+    collector.collect_events(Duration::from_secs(10)).await;
+    collector
+});
+
+// Perform operations that emit events
+perform_copy_operation().await?;
+location.reindex().await?;
+
+// Retrieve collector and analyze
+let collector = collection_handle.await.unwrap();
+
+// Print statistics summary
+let stats = collector.analyze().await;
+stats.print();
+
+// Print full event details for debugging (when using with_capture)
+collector.print_events().await;
+
+// Write events to JSON file for later inspection
+collector.write_to_file(&snapshot_dir.join("events.json")).await?;
+
+// Filter specific events
+let file_events = collector.get_resource_batch_events("file").await;
+let indexing_events = collector.get_events_by_type("IndexingCompleted").await;
+```
+
+The `EventCollector` tracks:
+- **ResourceChanged/ResourceChangedBatch** events by resource type
+- **Indexing** start/completion events
+- **Job** lifecycle events (started/completed)
+- **Entry** events (created/modified/deleted/moved)
+
+**Statistics Output:**
+```
+Event Statistics:
+==================
+
+ResourceChangedBatch events:
+  file → 45 resources
+
+Indexing events:
+  Started: 1
+  Completed: 1
+
+Entry events:
+  Created: 3
+  Modified: 0
+
+Job events:
+  Started:
+    indexer → 1
+  Completed:
+    indexer → 1
+```
+
+**Detailed Event Output (with `with_capture()`):**
+```
+=== Collected Events (8) ===
+
+[1] IndexingStarted
+  Location: 550e8400-e29b-41d4-a716-446655440000
+
+[2] JobStarted
+  Job: indexer (job_123)
+
+[3] ResourceChangedBatch
+  Type: file
+  Resources: 45 items
+  Paths: 1 affected
+
+[4] IndexingCompleted
+  Location: 550e8400-e29b-41d4-a716-446655440000
+  Files: 42, Dirs: 3
+
+[5] JobCompleted
+  Job: indexer (job_123)
+  Output: Success
+```
+
+**Use Cases:**
+- Verifying watcher events during file operations
+- Testing normalized cache updates
+- Debugging event emission patterns
+- Creating test fixtures with real event data
+- Inspecting actual resource payloads in events
 
 ### Database Verification
 
@@ -198,12 +480,31 @@ wait_for_sync(&core_b).await?;
 
 ### Common Utilities
 
-The framework provides helper functions in `core/tests/helpers/mod.rs`:
+The framework provides comprehensive test helpers in `core/tests/helpers/`:
 
+**Event Collection:**
+- `EventCollector` - Collect and analyze all events from the event bus
+- `EventStats` - Statistics about collected events with formatted output
+
+**Indexing Tests:**
+- `IndexingHarnessBuilder` - Create isolated test environments with indexing support
+- `TestLocation` - Builder for test locations with files
+- `LocationHandle` - Handle to indexed locations with verification methods
+
+**Sync Tests:**
+- `TwoDeviceHarnessBuilder` - Pre-configured two-device sync test environments
+- `MockTransport` - Mock network transport for deterministic sync testing
+- `wait_for_sync()` - Sophisticated sync completion detection
+- `TestConfigBuilder` - Custom test configurations
+
+**Database & Jobs:**
 - `wait_for_event()` - Wait for specific events with timeout
-- `create_test_location()` - Set up test locations with files
-- `count_location_entries()` - Query entry counts
-- `wait_for_job_completion()` - Monitor job execution
+- `wait_for_indexing()` - Wait for indexing job completion
+- `register_device()` - Register a device in a library
+
+<Tip>
+See `core/tests/helpers/README.md` for detailed documentation on all available helpers including usage examples and migration guides.
+</Tip>
 
 ### Test Volumes
 
@@ -292,10 +593,306 @@ Common debugging approaches:
 - [ ] Handle process coordination properly
 - [ ] Set reasonable timeouts
 
+## TypeScript Integration Testing
+
+Spacedrive provides a bridge infrastructure for running TypeScript tests against a real Rust daemon. This enables true end-to-end testing across the Rust backend and TypeScript frontend, verifying that cache updates, WebSocket events, and React hooks work correctly with real data.
+
+### Architecture
+
+The TypeScript bridge test pattern works as follows:
+
+1. **Rust test** creates a daemon with indexed locations using `IndexingHarnessBuilder`
+2. **Connection info** (TCP socket address, library ID, paths) written to JSON config file
+3. **Rust spawns** `bun test` with specific TypeScript test file
+4. **TypeScript test** reads config, connects to daemon via `SpacedriveClient.fromTcpSocket()`
+5. **TypeScript test** performs file operations and validates cache updates via React hooks
+6. **Rust validates** test exit code and cleans up
+
+This pattern tests the entire stack: Rust daemon → RPC transport → TypeScript client → React hooks → cache updates.
+
+### Writing Bridge Tests
+
+#### Rust Side
+
+Create a test in `core/tests/` that spawns the daemon and TypeScript test:
+
+```rust
+#[tokio::test]
+async fn test_typescript_cache_updates() -> anyhow::Result<()> {
+    // Create daemon with RPC server enabled
+    let harness = IndexingHarnessBuilder::new("typescript_bridge_test")
+        .enable_daemon() // Start RPC server for TypeScript client
+        .build()
+        .await?;
+
+    // Create test location with files
+    let test_location = harness.create_test_location("test_files").await?;
+    test_location.create_dir("folder_a").await?;
+    test_location.write_file("folder_a/file1.txt", "Content").await?;
+
+    // Index the location
+    let location = test_location
+        .index("Test Location", IndexMode::Shallow)
+        .await?;
+
+    // Get daemon socket address
+    let socket_addr = harness
+        .daemon_socket_addr()
+        .expect("Daemon should be enabled")
+        .to_string();
+
+    // Prepare bridge config for TypeScript
+    let bridge_config = TestBridgeConfig {
+        socket_addr,
+        library_id: harness.library.id().to_string(),
+        location_db_id: location.db_id,
+        location_path: test_location.path().to_path_buf(),
+        test_data_path: harness.temp_path().to_path_buf(),
+    };
+
+    // Write config to temp file
+    let config_path = harness.temp_path().join("bridge_config.json");
+    tokio::fs::write(&config_path, serde_json::to_string_pretty(&bridge_config)?).await?;
+
+    // Spawn TypeScript test
+    let ts_test_file = "packages/ts-client/tests/integration/mytest.test.ts";
+    let workspace_root = std::env::current_dir()?.parent().unwrap().to_path_buf();
+    let output = tokio::process::Command::new("bun")
+        .arg("test")
+        .arg(workspace_root.join(ts_test_file))
+        .env("BRIDGE_CONFIG_PATH", config_path.to_str().unwrap())
+        .current_dir(&workspace_root)
+        .output()
+        .await?;
+
+    // Verify TypeScript test passed
+    if !output.status.success() {
+        anyhow::bail!("TypeScript test failed: {:?}", output.status.code());
+    }
+
+    harness.shutdown().await?;
+    Ok(())
+}
+```
+
+<Note>
+Use `.enable_daemon()` on `IndexingHarnessBuilder` to start the RPC server. The daemon listens on a random TCP port returned by `.daemon_socket_addr()`.
+</Note>
+
+#### TypeScript Side
+
+Create a test in `packages/ts-client/tests/integration/`:
+
+```typescript
+import { describe, test, expect, beforeAll } from "bun:test";
+import { readFile } from "fs/promises";
+import { SpacedriveClient } from "../../src/client";
+import { renderHook, waitFor } from "@testing-library/react";
+import { SpacedriveProvider } from "../../src/hooks/useClient";
+import { useNormalizedQuery } from "../../src/hooks/useNormalizedQuery";
+
+interface BridgeConfig {
+    socket_addr: string;
+    library_id: string;
+    location_db_id: number;
+    location_path: string;
+    test_data_path: string;
+}
+
+let bridgeConfig: BridgeConfig;
+let client: SpacedriveClient;
+
+beforeAll(async () => {
+    // Read bridge config from Rust test
+    const configPath = process.env.BRIDGE_CONFIG_PATH;
+    const configJson = await readFile(configPath, "utf-8");
+    bridgeConfig = JSON.parse(configJson);
+
+    // Connect to daemon via TCP socket
+    client = SpacedriveClient.fromTcpSocket(bridgeConfig.socket_addr);
+    client.setCurrentLibrary(bridgeConfig.library_id);
+});
+
+describe("Cache Update Tests", () => {
+    test("should update cache when files move", async () => {
+        const wrapper = ({ children }) =>
+            React.createElement(SpacedriveProvider, { client }, children);
+
+        // Query directory listing with useNormalizedQuery
+        const { result } = renderHook(
+            () => useNormalizedQuery({
+                wireMethod: "query:files.directory_listing",
+                input: { path: { Physical: { path: folderPath } } },
+                resourceType: "file",
+                pathScope: { Physical: { path: folderPath } },
+                debug: true, // Enable debug logging
+            }),
+            { wrapper }
+        );
+
+        // Wait for initial data
+        await waitFor(() => {
+            expect(result.current.data).toBeDefined();
+        });
+
+        // Perform file operation
+        await rename(oldPath, newPath);
+
+        // Wait for watcher to detect change (500ms buffer + processing)
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        // Verify cache updated
+        expect(result.current.data.files).toContainEqual(
+            expect.objectContaining({ name: "newfile" })
+        );
+    });
+});
+```
+
+### TCP Transport
+
+TypeScript tests connect to the daemon via TCP socket using `TcpSocketTransport`. This transport is designed for Bun/Node.js environments and enables testing outside the browser.
+
+```typescript
+// Automatic with factory method
+const client = SpacedriveClient.fromTcpSocket("127.0.0.1:6969");
+
+// Manual construction
+import { TcpSocketTransport } from "@sd/ts-client/transports";
+const transport = new TcpSocketTransport("127.0.0.1:6969");
+const client = new SpacedriveClient(transport);
+```
+
+The TCP transport:
+- Uses JSON-RPC 2.0 over TCP
+- Supports WebSocket-style subscriptions for events
+- Automatically reconnects on connection loss
+- Works in both Bun and Node.js runtimes
+
+### Testing Cache Updates
+
+The primary use case for bridge tests is verifying that `useNormalizedQuery` cache updates work correctly when the daemon emits `ResourceChanged` or `ResourceChangedBatch` events.
+
+**Key patterns:**
+
+1. **Enable debug logging** with `debug: true` in `useNormalizedQuery` options
+2. **Wait for watcher delays** (500ms buffer + processing time, typically 2-8 seconds)
+3. **Collect events** by wrapping the subscription manager to log all received events
+4. **Verify cache state** using React Testing Library's `waitFor` and assertions
+
+```typescript
+// Enable debug logging
+const { result } = renderHook(
+    () => useNormalizedQuery({
+        wireMethod: "query:files.directory_listing",
+        input: { /* ... */ },
+        resourceType: "file",
+        pathScope: { /* ... */ },
+        debug: true, // Logs event processing
+    }),
+    { wrapper }
+);
+
+// Collect all events for debugging
+const allEvents: any[] = [];
+const originalCreateSubscription = (client as any).subscriptionManager.createSubscription;
+(client as any).subscriptionManager.createSubscription = function(filter: any, callback: any) {
+    const wrappedCallback = (event: any) => {
+        allEvents.push({ timestamp: new Date().toISOString(), event });
+        console.log(`Event received:`, JSON.stringify(event, null, 2));
+        callback(event);
+    };
+    return originalCreateSubscription.call(this, filter, wrappedCallback);
+};
+```
+
+### Running Bridge Tests
+
+```bash
+# Run all TypeScript bridge tests
+cargo test --package sd-core --test typescript_bridge_test -- --nocapture
+
+# Run specific bridge test
+cargo test test_typescript_use_normalized_query_with_file_moves -- --nocapture
+
+# Run only the TypeScript side (requires manual daemon setup)
+cd packages/ts-client
+BRIDGE_CONFIG_PATH=/path/to/config.json bun test tests/integration/mytest.test.ts
+```
+
+<Tip>
+Use `--nocapture` to see TypeScript test output. The Rust test prints all stdout/stderr from the TypeScript test process.
+</Tip>
+
+### Common Scenarios
+
+**File moves between folders:**
+- Tests that files removed from one directory appear in another
+- Verifies UUID preservation (move detection vs delete+create)
+
+**Folder renames:**
+- Tests that nested files update their paths correctly
+- Verifies parent path updates propagate to descendants
+
+**Bulk operations:**
+- Tests 20+ file moves with mixed Physical/Content paths
+- Verifies cache updates don't miss files during batched events
+
+**Content-addressed files:**
+- Uses `IndexMode::Content` to enable content identification
+- Tests that files with `alternate_paths` update correctly
+- Verifies metadata-only updates don't add duplicate cache entries
+
+### Debugging Bridge Tests
+
+**Check Rust logs:**
+```bash
+RUST_LOG=debug cargo test typescript_bridge -- --nocapture
+```
+
+**Check TypeScript output:**
+The Rust test prints all TypeScript stdout/stderr. Look for:
+- `[TS]` prefixed log messages
+- Event payloads with `🔔` emoji
+- Final event summary at test end
+
+**Verify daemon is running:**
+```bash
+# In Rust test output, look for:
+Socket address: 127.0.0.1:XXXXX
+Library ID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+```
+
+**Check bridge config:**
+```bash
+# The config file is written to test_data directory
+cat /tmp/test_data/typescript_bridge_test/bridge_config.json
+```
+
+**Common issues:**
+- **TypeScript test times out**: Increase watcher wait time (filesystem events can be slow)
+- **Cache not updating**: Enable `debug: true` to see if events are received
+- **Connection refused**: Verify daemon started with `.enable_daemon()`
+- **Wrong library**: Check that `client.setCurrentLibrary()` uses correct ID from config
+
 ## Examples
 
 For complete examples, refer to:
-- `tests/device_pairing_test.rs` - Multi-device pairing
-- `tests/sync_integration_test.rs` - Complex sync scenarios
+
+**Single Device Tests:**
+- `tests/copy_action_test.rs` - Event collection during file operations (persistent + ephemeral)
 - `tests/job_resumption_integration_test.rs` - Job interruption handling
+
+**Subprocess Framework (Real Networking):**
+- `tests/device_pairing_test.rs` - Device pairing with real network discovery
+
+**Custom Harness (Mock Transport):**
+- `tests/sync_realtime_test.rs` - Real-time sync testing with deterministic transport
+- `tests/sync_integration_test.rs` - Complex sync scenarios with mock networking
 - `tests/file_transfer_test.rs` - Cross-device file operations
+
+**TypeScript Bridge Tests:**
+- `tests/typescript_bridge_test.rs` - Rust harness that spawns TypeScript tests
+- `packages/ts-client/tests/integration/useNormalizedQuery.test.ts` - File move cache updates
+- `packages/ts-client/tests/integration/useNormalizedQuery.folder-rename.test.ts` - Folder rename propagation
+- `packages/ts-client/tests/integration/useNormalizedQuery.bulk-moves.test.ts` - Bulk operations with content-addressed files

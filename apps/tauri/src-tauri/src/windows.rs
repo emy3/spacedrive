@@ -372,7 +372,7 @@ fn create_window(
 	always_on_top: bool,
 	transparent: bool,
 ) -> Result<WebviewWindow, String> {
-	let window = WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
+	let mut builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
 		.title(title)
 		.inner_size(size.0, size.1)
 		.min_inner_size(min_size.0, min_size.1)
@@ -380,12 +380,21 @@ fn create_window(
 		.decorations(decorations)
 		.transparent(transparent)
 		.always_on_top(always_on_top)
-		.center()
+		.center();
+
+	// Enable DevTools in dev mode
+	#[cfg(debug_assertions)]
+	{
+		builder = builder.devtools(true);
+	}
+
+	let window = builder
 		.build()
 		.map_err(|e| format!("Failed to create window: {}", e))?;
 
 	window.show().ok();
 	window.set_focus().ok();
+
 	Ok(window)
 }
 
