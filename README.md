@@ -235,6 +235,7 @@ cd apps/tauri
 bun run tauri:dev
 ```
 
+
 ### Quick Start with CLI
 
 The CLI can manage libraries and run a persistent daemon that other apps connect to:
